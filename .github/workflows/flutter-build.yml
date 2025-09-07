@@ -1,0 +1,46 @@
+name: Build Flutter APK & AAB
+
+on:
+  push:
+    branches: [ "main" ]   # runs on push to main
+  workflow_dispatch:       # allow manual trigger
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.2'   # ✅ match your local Flutter (Dart 3.9.0)
+
+      - name: Flutter doctor (debug info)
+        run: flutter doctor -v
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Build release AppBundle (AAB)
+        run: flutter build appbundle --release
+
+      - name: List build outputs (debug)
+        run: ls -R build/app/outputs/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aab
+          path: build/app/outputs/bundle/release/app-release.aab
