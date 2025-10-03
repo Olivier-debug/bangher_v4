@@ -26,6 +26,9 @@ import '../theme/app_theme.dart';
 import '../widgets/app_bottom_nav.dart';
 import '../features/profile/services/profile_guard.dart';
 
+// NEW: Email verification screen
+import '../features/auth/email_code_verify_page.dart';
+
 // Confessions UI
 import '../features/confessions/ui/confessions_feed_page.dart';
 import '../features/confessions/ui/confession_detail_page.dart';
@@ -52,17 +55,21 @@ final Provider<GoRouter> routerProvider = Provider<GoRouter>((ref) {
     final atLogin = here == LoginPageWidget.routePath;
     final atOnboarding = here == OnboardingPage.routePath;
     final atCreateComplete = here == CreateOrCompleteProfilePage.routePath;
+    // NEW: verify route flag
+    final atVerify = here == EmailCodeVerifyPage.routePath;
 
     if (atSplash) return null;
 
     final session = auth.currentSession;
 
+    // Not signed in: allow auth-related routes incl. verify-email
     if (session == null) {
-      if (atLogin || atOnboarding || atSplash) return null;
+      if (atLogin || atOnboarding || atSplash || atVerify) return null;
       return LoginPageWidget.routePath;
     }
 
-    if (atCreateComplete) return null;
+    // Signed in: allow create/complete & verify (verify page harmless if reached)
+    if (atCreateComplete || atVerify) return null;
 
     if (atLogin) {
       final st = profileGateListenable.value;
@@ -103,6 +110,19 @@ final Provider<GoRouter> routerProvider = Provider<GoRouter>((ref) {
         path: LoginPageWidget.routePath,
         name: LoginPageWidget.routeName,
         builder: (_, __) => const LoginPageWidget(),
+      ),
+      // NEW: Verify Email (OTP)
+      GoRoute(
+        path: EmailCodeVerifyPage.routePath, // '/verify-email'
+        name: EmailCodeVerifyPage.routeName,
+        parentNavigatorKey: _rootNavigatorKey,
+        builder: (context, state) {
+          final email = state.uri.queryParameters['email'] ?? '';
+          if (email.isEmpty) {
+            return const _VerifyMissingEmailFallback();
+          }
+          return EmailCodeVerifyPage(email: email, fresh: true);
+        },
       ),
 
       // ───────── Standalone (no bottom nav) ─────────
@@ -547,6 +567,28 @@ class _HeaderBell extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+class _VerifyMissingEmailFallback extends StatelessWidget {
+  const _VerifyMissingEmailFallback();
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Verification', style: TextStyle(fontSize: 22, color: Colors.white)),
+            const SizedBox(height: 8),
+            const Text('Missing email. Returning to login…', style: TextStyle(fontSize: 14, color: Colors.white70)),
+            const SizedBox(height: 16),
+            ElevatedButton(onPressed: () => context.go(LoginPageWidget.routePath), child: const Text('Go to Login')),
+          ],
+        ),
+      ),
     );
   }
 }

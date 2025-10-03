@@ -1,18 +1,23 @@
 // FILE: lib/features/profile/pages/edit_profile_page.dart
 // Offline-first: hydrates from PeerProfileCache, saves via MyProfileStore outbox,
-// and persists a photo upload queue to resume after app restarts.
+// persists a photo upload queue to resume after app restarts, and now:
+// - Uses shared StorageUrlResolver (no local cache)
+// - Adds connectivity banner (offline edits queue safely)
+// - Warms & prefetches photos (native) to cut flicker
 
+import 'dart:async' show StreamSubscription, unawaited;
 import 'dart:convert';
 import 'dart:typed_data';
- // keep original Uint8List import below intact if present
 
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:image_picker/image_picker.dart';
-import 'package:go_router/go_router.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:go_router/go_router.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../theme/app_theme.dart';
 import '../repositories/edit_profile_repository.dart';
@@ -22,80 +27,20 @@ import '../../../widgets/photo_cropper_dialog.dart';
 import '../../../core/cache/peer_profile_cache.dart';
 import '../../profile/application/providers.dart' as profile_facade;
 
-// ⬇️ Added: global cache wiper integration
+// Global cache wiper
 import '../../../core/cache_wiper.dart';
+
+// Shared storage URL resolver (same one used by ViewProfilePage)
+import '../../../core/images/storage_url_resolver.dart';
+
+// Added: native image cache + offline image widget
+import '../../../core/cache/pinned_image_cache.dart';
+import '../../../widgets/offline_image.dart';
 
 // ──────────────────────────────────────────────────────────────
 // Top-level enums
 enum _Hydration { none, local, remote }
 enum _LeaveAction { discard, save, cancel }
-
-// ──────────────────────────────────────────────────────────────
-// Signed URL resolver (public URLs return immediately) with tiny TTL cache.
-class _SignedUrlCache {
-  static const Duration _ttl = Duration(minutes: 30);
-  static final Map<String, _SignedUrlEntry> _map = {};
-  static const String _defaultBucket = 'profile_pictures';
-
-  static Future<String> resolve(String urlOrPath) async {
-    if (urlOrPath.startsWith('http')) return urlOrPath;
-
-    final now = DateTime.now();
-    final hit = _map[urlOrPath];
-    if (hit != null && now.isBefore(hit.expires)) return hit.url;
-
-    var cleaned = urlOrPath
-        .replaceFirst(RegExp(r'^storage://'), '')
-        .replaceFirst(RegExp(r'^/+'), '');
-
-    String bucket;
-    String path;
-
-    final slash = cleaned.indexOf('/');
-    if (slash <= 0) {
-      bucket = _defaultBucket;
-      path = cleaned;
-    } else {
-      bucket = cleaned.substring(0, slash);
-      path = cleaned.substring(slash + 1);
-      if (bucket.isEmpty) bucket = _defaultBucket;
-    }
-
-    final signed = await Supabase.instance.client.storage
-        .from(bucket)
-        .createSignedUrl(path, _ttl.inSeconds);
-
-    _map[urlOrPath] = _SignedUrlEntry(
-      signed,
-      now.add(_ttl - const Duration(minutes: 2)),
-    );
-    return signed;
-  }
-
-  // ⬇️ Added: allow global wiper to clear this TTL map
-  static void clear() {
-    _map.clear();
-  }
-}
-
-// ⬇️ Added: public helper + hook so CacheWiper can nuke this file-local cache
-void clearEditProfileSignedUrlCache() => _SignedUrlCache.clear();
-
-void _registerEditProfileWipeHook() {
-  CacheWiper.registerHook(() async {
-    clearEditProfileSignedUrlCache();
-  });
-}
-
-// ignore: unused_element
-final bool _editProfileWipeHookRegistered =
-    (() { _registerEditProfileWipeHook(); return true; })();
-
-class _SignedUrlEntry {
-  _SignedUrlEntry(this.url, this.expires);
-  final String url;
-  final DateTime expires;
-}
 
 // ── Shared design tokens
 const double _screenHPad = 10;
@@ -117,6 +62,10 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
   Color get _outline => AppTheme.ffAlt;
 
   _Hydration _hydrated = _Hydration.none;
+
+  // Connectivity banner
+  bool _isOffline = false;
+  StreamSubscription? _connSub;
 
   // Text/controllers
   final _name = TextEditingController();
@@ -180,34 +129,13 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
   ];
 
   static const interestOptions = [
-    'Travel',
-    'Music',
-    'Foodie',
-    'Art',
-    'Outdoors',
-    'Fitness',
-    'Movies',
-    'Reading',
-    'Gaming',
+    'Travel', 'Music', 'Foodie', 'Art', 'Outdoors', 'Fitness', 'Movies', 'Reading', 'Gaming',
   ];
   static const goalOptions = [
-    'Long-term',
-    'Short-term',
-    'Open to explore',
-    'Marriage',
-    'Friendship',
+    'Long-term', 'Short-term', 'Open to explore', 'Marriage', 'Friendship',
   ];
   static const languageOptions = [
-    'English',
-    'Afrikaans',
-    'Zulu',
-    'Xhosa',
-    'Sotho',
-    'French',
-    'Spanish',
-    'German',
-    'Italian',
-    'Portuguese',
+    'English','Afrikaans','Zulu','Xhosa','Sotho','French','Spanish','German','Italian','Portuguese',
   ];
 
   static const petsOptions = ['No pets', 'Cat person', 'Dog person', 'All the pets'];
@@ -218,45 +146,26 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
   static const dietaryOptions = ['Omnivore', 'Vegetarian', 'Vegan', 'Pescatarian', 'Halal', 'Kosher'];
   static const sleepingOptions = ['Early bird', 'Night owl', 'Flexible'];
   static const zodiacOptions = [
-    'Aries',
-    'Taurus',
-    'Gemini',
-    'Cancer',
-    'Leo',
-    'Virgo',
-    'Libra',
-    'Scorpio',
-    'Sagittarius',
-    'Capricorn',
-    'Aquarius',
-    'Pisces',
+    'Aries','Taurus','Gemini','Cancer','Leo','Virgo','Libra','Scorpio','Sagittarius','Capricorn','Aquarius','Pisces',
   ];
 
   // ---- DB <-> UI mappers (gender) ----
   String? _fromDbGender(String? raw) {
     if (raw == null) return null;
     switch (raw.toUpperCase()) {
-      case 'M':
-        return 'Male';
-      case 'F':
-        return 'Female';
-      case 'O':
-        return 'Other';
-      default:
-        return raw;
+      case 'M': return 'Male';
+      case 'F': return 'Female';
+      case 'O': return 'Other';
+      default:  return raw;
     }
   }
 
   String? _toDbGender(String? label) {
     switch (label) {
-      case 'Male':
-        return 'M';
-      case 'Female':
-        return 'F';
-      case 'Other':
-        return 'O';
-      default:
-        return label;
+      case 'Male': return 'M';
+      case 'Female': return 'F';
+      case 'Other': return 'O';
+      default: return label;
     }
   }
 
@@ -267,6 +176,8 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
   void initState() {
     super.initState();
 
+    _bootstrapConnectivity();
+
     // 1) local-first hydration
     _hydrateFromLocalFirst();
 
@@ -275,6 +186,7 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
     if (first != null && _hydrated != _Hydration.remote) {
       _prefillFromRaw(first);
       _hydrated = _Hydration.remote;
+      _warmPhotos();
     }
 
     // 3) listen for remote updates using listenManual (allowed in initState)
@@ -286,12 +198,40 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
             _hydrated = _Hydration.remote;
             _prefillFromRaw(next);
           });
+          _warmPhotos();
         }
       },
     );
 
     // 4) resume the photo outbox after first frame
     WidgetsBinding.instance.addPostFrameCallback((_) => _flushPhotoOutbox());
+
+    // Optional: hook storage resolver into global wiper if it exposes a clear()
+    CacheWiper.registerHook(() async {
+      // e.g., StorageUrlResolver.clear(); (no-op if not needed)
+    });
+  }
+
+  Future<void> _bootstrapConnectivity() async {
+    final connectivity = Connectivity();
+    final initial = await connectivity.checkConnectivity();
+    _isOffline = _allNone(initial);
+    if (mounted) setState(() {});
+    _connSub?.cancel();
+    _connSub = connectivity.onConnectivityChanged.listen((results) {
+      final nextOffline = _allNone(results);
+      if (!mounted || nextOffline == _isOffline) return;
+      setState(() => _isOffline = nextOffline);
+    });
+  }
+
+  bool _allNone(dynamic v) {
+    if (v is ConnectivityResult) return v == ConnectivityResult.none;
+    if (v is List<ConnectivityResult>) {
+      if (v.isEmpty) return true;
+      return v.every((r) => r == ConnectivityResult.none);
+    }
+    return false;
   }
 
   Future<void> _hydrateFromLocalFirst() async {
@@ -302,18 +242,14 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
     if (mounted && _hydrated == _Hydration.none) {
       _prefillFromRaw(raw);
       setState(() => _hydrated = _Hydration.local);
+      _warmPhotos();
     }
   }
 
   void _prefillFromRaw(Map<String, dynamic> m) {
-    String? str(dynamic v) =>
-        (v?.toString().trim().isEmpty ?? true) ? null : v.toString().trim();
+    String? str(dynamic v) => (v?.toString().trim().isEmpty ?? true) ? null : v.toString().trim();
     List<String> listStr(dynamic v) => v is List
-        ? v
-            .map((e) => e?.toString() ?? '')
-            .where((t) => t.trim().isNotEmpty)
-            .cast<String>()
-            .toList()
+        ? v.map((e) => e?.toString() ?? '').where((t) => t.trim().isNotEmpty).cast<String>().toList()
         : <String>[];
 
     _name.text = str(m['name']) ?? '';
@@ -334,21 +270,10 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
       _dob = null;
     }
 
-    _pictures
-      ..clear()
-      ..addAll(listStr(m['profile_pictures']));
-
-    _interests
-      ..clear()
-      ..addAll(listStr(m['interests']));
-
-    _relationshipGoals
-      ..clear()
-      ..addAll(listStr(m['relationship_goals']));
-
-    _languages
-      ..clear()
-      ..addAll(listStr(m['my_languages']));
+    _pictures..clear()..addAll(listStr(m['profile_pictures']));
+    _interests..clear()..addAll(listStr(m['interests']));
+    _relationshipGoals..clear()..addAll(listStr(m['relationship_goals']));
+    _languages..clear()..addAll(listStr(m['my_languages']));
 
     _drinking = str(m['drinking']);
     _smoking = str(m['smoking']);
@@ -371,9 +296,40 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
     }
   }
 
+  // Warm the first photo + prefetch all (native)
+  Future<void> _warmPhotos() async {
+    if (_pictures.isEmpty) return;
+
+    final first = _pictures.first;
+    final firstUrl = first.startsWith('http')
+        ? first
+        : await resolveStorageUrl(supa: Supabase.instance.client, raw: first);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(precacheImage(NetworkImage(firstUrl), context));
+    });
+
+    if (!kIsWeb) {
+      final urls = <String>[];
+      for (final p in _pictures) {
+        if (p.startsWith('http')) {
+          urls.add(p);
+        } else {
+          try {
+            final u = await resolveStorageUrl(supa: Supabase.instance.client, raw: p);
+            urls.add(u);
+          } catch (_) {}
+        }
+      }
+      unawaited(PinnedImageCache.instance.prefetchAll(urls, uid: _meId()));
+    }
+  }
+
   @override
   void dispose() {
-    _profileSub?.close(); // <- important
+    _profileSub?.close();
+    _connSub?.cancel();
 
     _name.dispose();
     _city.dispose();
@@ -433,337 +389,371 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
 
     Widget form() => Form(
           key: _formKey,
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(_screenHPad, 16, _screenHPad, 24),
+          child: Stack(
             children: [
-              // PHOTOS
-              _Card(
-                radius: _radiusCard,
-                outline: _outline,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _Heading(icon: Icons.photo_library_outlined, text: 'Photos'),
-                    const SizedBox(height: 12),
-                    _PhotosGrid(
-                      pictures: _pictures,
-                      onAdd: _onAddPhoto,
-                      onTapImage: (i) => _openPhotoViewer(i),
-                    ),
-                    const SizedBox(height: 8),
-                    const Text(
-                      'Tip: Add 3–6 clear photos for the best results.',
-                      style: TextStyle(color: Colors.white54, fontSize: 12),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // BASICS
-              _Card(
-                radius: _radiusCard,
-                outline: _outline,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _Heading(icon: Icons.badge_outlined, text: 'Basics'),
-                    const SizedBox(height: 12),
-                    _LabeledText('Name', _name, required: true, onChanged: (_) => _markDirty()),
-                    const SizedBox(height: 12),
-                    _Dropdown<String>(
-                      label: 'Gender',
-                      value: _gender,
-                      items: genders,
-                      onChanged: (v) => setState(() {
-                        _gender = v;
-                        _dirty = true;
-                      }),
-                    ),
-                    const SizedBox(height: 12),
-                    _Dropdown<String>(
-                      label: 'Sexual orientation (optional)',
-                      value: _sexualOrientation,
-                      items: sexualOrientationOptions,
-                      onChanged: (v) => setState(() {
-                        _sexualOrientation = v;
-                        _dirty = true;
-                      }),
-                    ),
-                    const SizedBox(height: 12),
-                    _DatePickerRow(
-                      label: 'Date of birth',
-                      value: _dob,
-                      onPick: (d) => setState(() {
-                        _dob = d;
-                        _dirty = true;
-                      }),
-                    ),
-                    const SizedBox(height: 12),
-                    _LabeledText('Current city', _city, onChanged: (_) => _markDirty()),
-                    const SizedBox(height: 10),
-                    Row(
+              ListView(
+                padding: const EdgeInsets.fromLTRB(_screenHPad, 16, _screenHPad, 24),
+                children: [
+                  // PHOTOS
+                  _Card(
+                    radius: _radiusCard,
+                    outline: _outline,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        ElevatedButton.icon(
-                          onPressed: _captureLocation,
-                          icon: const Icon(Icons.my_location, size: 18, color: Colors.white),
-                          label: const Text('Use my location', style: TextStyle(color: Colors.white)),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: AppTheme.ffPrimary,
-                            shape: const StadiumBorder(),
-                          ),
+                        const _Heading(icon: Icons.photo_library_outlined, text: 'Photos'),
+                        const SizedBox(height: 12),
+                        _PhotosGrid(
+                          ownerUid: me.id,
+                          pictures: _pictures,
+                          onAdd: _onAddPhoto,
+                          onTapImage: (i) => _openPhotoViewer(i),
                         ),
-                        const SizedBox(width: 10),
-                        if (_location2 != null)
-                          const Text('Location set ✓', style: TextStyle(color: Colors.white70)),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'Tip: Add 3–6 clear photos for the best results.',
+                          style: TextStyle(color: Colors.white54, fontSize: 12),
+                        ),
                       ],
                     ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // BASICS
+                  _Card(
+                    radius: _radiusCard,
+                    outline: _outline,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const _Heading(icon: Icons.badge_outlined, text: 'Basics'),
+                        const SizedBox(height: 12),
+                        _LabeledText('Name', _name, required: true, onChanged: (_) => _markDirty()),
+                        const SizedBox(height: 12),
+                        _Dropdown<String>(
+                          label: 'Gender',
+                          value: _gender,
+                          items: genders,
+                          onChanged: (v) => setState(() {
+                            _gender = v;
+                            _dirty = true;
+                          }),
+                        ),
+                        const SizedBox(height: 12),
+                        _Dropdown<String>(
+                          label: 'Sexual orientation (optional)',
+                          value: _sexualOrientation,
+                          items: sexualOrientationOptions,
+                          onChanged: (v) => setState(() {
+                            _sexualOrientation = v;
+                            _dirty = true;
+                          }),
+                        ),
+                        const SizedBox(height: 12),
+                        _DatePickerRow(
+                          label: 'Date of birth',
+                          value: _dob,
+                          onPick: (d) => setState(() {
+                            _dob = d;
+                            _dirty = true;
+                          }),
+                        ),
+                        const SizedBox(height: 12),
+                        _LabeledText('Current city', _city, onChanged: (_) => _markDirty()),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            ElevatedButton.icon(
+                              onPressed: _captureLocation,
+                              icon: const Icon(Icons.my_location, size: 18, color: Colors.white),
+                              label: const Text('Use my location', style: TextStyle(color: Colors.white)),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: AppTheme.ffPrimary,
+                                shape: const StadiumBorder(),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            if (_location2 != null)
+                              const Text('Location set ✓', style: TextStyle(color: Colors.white70)),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // ABOUT ME
+                  _Card(
+                    radius: _radiusCard,
+                    outline: _outline,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const _Heading(icon: Icons.info_outline, text: 'About me'),
+                        const SizedBox(height: 12),
+                        _LabeledText('Short bio', _bio, maxLines: 4, onChanged: (_) => _markDirty()),
+                        const SizedBox(height: 12),
+                        _LabeledText('Love style (love language)', _loveLanguage, onChanged: (_) => _markDirty()),
+                        const SizedBox(height: 12),
+                        _LabeledText('Communication style', _communicationStyle, onChanged: (_) => _markDirty()),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // LIFESTYLE
+                  _Card(
+                    radius: _radiusCard,
+                    outline: _outline,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const _Heading(icon: Icons.style_outlined, text: 'Lifestyle'),
+                        const SizedBox(height: 12),
+
+                        const _Subheading(icon: Icons.pets_outlined, text: 'Pets'),
+                        const SizedBox(height: 6),
+                        _RadioRow(
+                          label: '',
+                          value: _pets,
+                          options: petsOptions,
+                          onChanged: (v) => setState(() {
+                            _pets = v;
+                            _dirty = true;
+                          }),
+                          showLabel: false,
+                        ),
+                        const SizedBox(height: 10),
+
+                        const _Subheading(icon: Icons.local_bar_rounded, text: 'Drinking'),
+                        const SizedBox(height: 6),
+                        _RadioRow(
+                          label: '',
+                          value: _drinking,
+                          options: drinkingOptions,
+                          onChanged: (v) => setState(() {
+                            _drinking = v;
+                            _dirty = true;
+                          }),
+                          showLabel: false,
+                        ),
+                        const SizedBox(height: 10),
+
+                        const _Subheading(icon: Icons.smoke_free, text: 'Smoking'),
+                        const SizedBox(height: 6),
+                        _RadioRow(
+                          label: '',
+                          value: _smoking,
+                          options: smokingOptions,
+                          onChanged: (v) => setState(() {
+                            _smoking = v;
+                            _dirty = true;
+                          }),
+                          showLabel: false,
+                        ),
+                        const SizedBox(height: 10),
+
+                        const _Subheading(icon: Icons.fitness_center, text: 'Workout'),
+                        const SizedBox(height: 6),
+                        _RadioRow(
+                          label: '',
+                          value: _workout,
+                          options: workoutOptions,
+                          onChanged: (v) => setState(() {
+                            _workout = v;
+                            _dirty = true;
+                          }),
+                          showLabel: false,
+                        ),
+                        const SizedBox(height: 10),
+
+                        const _Subheading(icon: Icons.restaurant_menu, text: 'Dietary preference'),
+                        const SizedBox(height: 6),
+                        _RadioRow(
+                          label: '',
+                          value: _dietary,
+                          options: dietaryOptions,
+                          onChanged: (v) => setState(() {
+                            _dietary = v;
+                            _dirty = true;
+                          }),
+                          showLabel: false,
+                        ),
+                        const SizedBox(height: 10),
+
+                        const _Subheading(icon: Icons.nightlight_round, text: 'Sleeping habits'),
+                        const SizedBox(height: 6),
+                        _RadioRow(
+                          label: '',
+                          value: _sleeping,
+                          options: sleepingOptions,
+                          onChanged: (v) => setState(() {
+                            _sleeping = v;
+                            _dirty = true;
+                          }),
+                          showLabel: false,
+                        ),
+                        const SizedBox(height: 12),
+
+                        _LabeledText('Social media (handle / link)', _socialMedia, onChanged: (_) => _markDirty()),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // INTERESTS
+                  _Card(
+                    radius: _radiusCard,
+                    outline: _outline,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const _Heading(icon: Icons.interests_outlined, text: 'Interests'),
+                        const SizedBox(height: 10),
+                        _ChipsSelector(
+                          options: interestOptions,
+                          values: _interests,
+                          onChanged: (v) => setState(() {
+                            _interests..clear()..addAll(v);
+                            _dirty = true;
+                          }),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // RELATIONSHIP GOALS
+                  _Card(
+                    radius: _radiusCard,
+                    outline: _outline,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const _Heading(icon: Icons.flag_outlined, text: 'Relationship goals'),
+                        const SizedBox(height: 10),
+                        _ChipsSelector(
+                          options: goalOptions,
+                          values: _relationshipGoals,
+                          onChanged: (v) => setState(() {
+                            _relationshipGoals..clear()..addAll(v);
+                            _dirty = true;
+                          }),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // LANGUAGES
+                  _Card(
+                    radius: _radiusCard,
+                    outline: _outline,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const _Heading(icon: Icons.translate_outlined, text: 'Languages I know'),
+                        const SizedBox(height: 10),
+                        _CheckboxGroup(
+                          options: languageOptions,
+                          values: _languages,
+                          onChanged: (v) => setState(() {
+                            _languages..clear()..addAll(v);
+                            _dirty = true;
+                          }),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // MORE ABOUT ME
+                  _Card(
+                    radius: _radiusCard,
+                    outline: _outline,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const _Heading(icon: Icons.more_horiz_rounded, text: 'More about me'),
+                        const SizedBox(height: 12),
+                        _LabeledText('Education', _education, onChanged: (_) => _markDirty()),
+                        const SizedBox(height: 12),
+                        _LabeledText('Family plans', _familyPlans, onChanged: (_) => _markDirty()),
+                        const SizedBox(height: 12),
+                        _NumberPickerRow(
+                          label: 'Height (cm)',
+                          value: _heightCm,
+                          min: 120,
+                          max: 220,
+                          onChanged: (v) => setState(() {
+                            _heightCm = v;
+                            _dirty = true;
+                          }),
+                        ),
+                        const SizedBox(height: 12),
+                        _Dropdown<String>(
+                          label: 'Zodiac (optional)',
+                          value: _zodiac,
+                          items: zodiacOptions,
+                          onChanged: (v) => setState(() {
+                            _zodiac = v;
+                            _dirty = true;
+                          }),
+                        ),
+                        const SizedBox(height: 12),
+                        _LabeledText('Personality type (e.g., ENFJ)', _personalityType, onChanged: (_) => _markDirty()),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  ElevatedButton(
+                    onPressed: _saving ? null : _onSave,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppTheme.ffPrimary,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                    child: _saving
+                        ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Text('Save Changes', style: TextStyle(color: Colors.white, fontSize: 16)),
+                  ),
+                ],
               ),
-              const SizedBox(height: 12),
 
-              // ABOUT ME
-              _Card(
-                radius: _radiusCard,
-                outline: _outline,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _Heading(icon: Icons.info_outline, text: 'About me'),
-                    const SizedBox(height: 12),
-                    _LabeledText('Short bio', _bio, maxLines: 4, onChanged: (_) => _markDirty()),
-                    const SizedBox(height: 12),
-                    _LabeledText('Love style (love language)', _loveLanguage, onChanged: (_) => _markDirty()),
-                    const SizedBox(height: 12),
-                    _LabeledText('Communication style', _communicationStyle, onChanged: (_) => _markDirty()),
-                  ],
+              // Offline banner (edits queue while offline)
+              _bannerOverlay(),
+
+              // Photo busy HUD to read _photoBusy/_photoBusyMsg (prevents "unused_field")
+              if (_photoBusy)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: AnimatedOpacity(
+                      duration: const Duration(milliseconds: 120),
+                      opacity: _photoBusy ? 1 : 0,
+                      child: Container(
+                        color: Colors.black.withValues(alpha: 0.55),
+                        child: Center(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                            decoration: BoxDecoration(
+                              color: AppTheme.ffPrimaryBg,
+                              border: Border.all(color: AppTheme.ffAlt),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                                const SizedBox(width: 10),
+                                Text(_photoBusyMsg, style: const TextStyle(color: Colors.white)),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-              const SizedBox(height: 12),
-
-              // LIFESTYLE
-              _Card(
-                radius: _radiusCard,
-                outline: _outline,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _Heading(icon: Icons.style_outlined, text: 'Lifestyle'),
-                    const SizedBox(height: 12),
-
-                    const _Subheading(icon: Icons.pets_outlined, text: 'Pets'),
-                    const SizedBox(height: 6),
-                    _RadioRow(
-                      label: '',
-                      value: _pets,
-                      options: petsOptions,
-                      onChanged: (v) => setState(() {
-                        _pets = v;
-                        _dirty = true;
-                      }),
-                      showLabel: false,
-                    ),
-                    const SizedBox(height: 10),
-
-                    const _Subheading(icon: Icons.local_bar_rounded, text: 'Drinking'),
-                    const SizedBox(height: 6),
-                    _RadioRow(
-                      label: '',
-                      value: _drinking,
-                      options: drinkingOptions,
-                      onChanged: (v) => setState(() {
-                        _drinking = v;
-                        _dirty = true;
-                      }),
-                      showLabel: false,
-                    ),
-                    const SizedBox(height: 10),
-
-                    const _Subheading(icon: Icons.smoke_free, text: 'Smoking'),
-                    const SizedBox(height: 6),
-                    _RadioRow(
-                      label: '',
-                      value: _smoking,
-                      options: smokingOptions,
-                      onChanged: (v) => setState(() {
-                        _smoking = v;
-                        _dirty = true;
-                      }),
-                      showLabel: false,
-                    ),
-                    const SizedBox(height: 10),
-
-                    const _Subheading(icon: Icons.fitness_center, text: 'Workout'),
-                    const SizedBox(height: 6),
-                    _RadioRow(
-                      label: '',
-                      value: _workout,
-                      options: workoutOptions,
-                      onChanged: (v) => setState(() {
-                        _workout = v;
-                        _dirty = true;
-                      }),
-                      showLabel: false,
-                    ),
-                    const SizedBox(height: 10),
-
-                    const _Subheading(icon: Icons.restaurant_menu, text: 'Dietary preference'),
-                    const SizedBox(height: 6),
-                    _RadioRow(
-                      label: '',
-                      value: _dietary,
-                      options: dietaryOptions,
-                      onChanged: (v) => setState(() {
-                        _dietary = v;
-                        _dirty = true;
-                      }),
-                      showLabel: false,
-                    ),
-                    const SizedBox(height: 10),
-
-                    const _Subheading(icon: Icons.nightlight_round, text: 'Sleeping habits'),
-                    const SizedBox(height: 6),
-                    _RadioRow(
-                      label: '',
-                      value: _sleeping,
-                      options: sleepingOptions,
-                      onChanged: (v) => setState(() {
-                        _sleeping = v;
-                        _dirty = true;
-                      }),
-                      showLabel: false,
-                    ),
-                    const SizedBox(height: 12),
-
-                    _LabeledText('Social media (handle / link)', _socialMedia, onChanged: (_) => _markDirty()),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // INTERESTS
-              _Card(
-                radius: _radiusCard,
-                outline: _outline,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _Heading(icon: Icons.interests_outlined, text: 'Interests'),
-                    const SizedBox(height: 10),
-                    _ChipsSelector(
-                      options: interestOptions,
-                      values: _interests,
-                      onChanged: (v) => setState(() {
-                        _interests
-                          ..clear()
-                          ..addAll(v);
-                        _dirty = true;
-                      }),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // RELATIONSHIP GOALS
-              _Card(
-                radius: _radiusCard,
-                outline: _outline,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _Heading(icon: Icons.flag_outlined, text: 'Relationship goals'),
-                    const SizedBox(height: 10),
-                    _ChipsSelector(
-                      options: goalOptions,
-                      values: _relationshipGoals,
-                      onChanged: (v) => setState(() {
-                        _relationshipGoals
-                          ..clear()
-                          ..addAll(v);
-                        _dirty = true;
-                      }),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // LANGUAGES
-              _Card(
-                radius: _radiusCard,
-                outline: _outline,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _Heading(icon: Icons.translate_outlined, text: 'Languages I know'),
-                    const SizedBox(height: 10),
-                    _CheckboxGroup(
-                      options: languageOptions,
-                      values: _languages,
-                      onChanged: (v) => setState(() {
-                        _languages
-                          ..clear()
-                          ..addAll(v);
-                        _dirty = true;
-                      }),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              // MORE ABOUT ME
-              _Card(
-                radius: _radiusCard,
-                outline: _outline,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _Heading(icon: Icons.more_horiz_rounded, text: 'More about me'),
-                    const SizedBox(height: 12),
-                    _LabeledText('Education', _education, onChanged: (_) => _markDirty()),
-                    const SizedBox(height: 12),
-                    _LabeledText('Family plans', _familyPlans, onChanged: (_) => _markDirty()),
-                    const SizedBox(height: 12),
-                    _NumberPickerRow(
-                      label: 'Height (cm)',
-                      value: _heightCm,
-                      min: 120,
-                      max: 220,
-                      onChanged: (v) => setState(() {
-                        _heightCm = v;
-                        _dirty = true;
-                      }),
-                    ),
-                    const SizedBox(height: 12),
-                    _Dropdown<String>(
-                      label: 'Zodiac (optional)',
-                      value: _zodiac,
-                      items: zodiacOptions,
-                      onChanged: (v) => setState(() {
-                        _zodiac = v;
-                        _dirty = true;
-                      }),
-                    ),
-                    const SizedBox(height: 12),
-                    _LabeledText('Personality type (e.g., ENFJ)', _personalityType, onChanged: (_) => _markDirty()),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-              ElevatedButton(
-                onPressed: _saving ? null : _onSave,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppTheme.ffPrimary,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                ),
-                child: _saving
-                    ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Text('Save Changes', style: TextStyle(color: Colors.white, fontSize: 16)),
-              ),
             ],
           ),
         );
@@ -783,60 +773,65 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
           title: const Text('Edit Profile'),
           actions: const [SizedBox(width: 8)],
         ),
-        body: Stack(
-          children: [
-            SafeArea(
-              child: profileAsync.when(
-                loading: () => _hydrated != _Hydration.none
-                    ? form()
-                    : const Center(child: CircularProgressIndicator()),
-                error: (e, _) => _hydrated != _Hydration.none
-                    ? form()
-                    : Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Text(
-                            'Failed to load profile: $e',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(color: Colors.white70),
-                          ),
-                        ),
-                      ),
-                data: (_) => form(),
-              ),
-            ),
-
-            if (_photoBusy)
-              Positioned.fill(
-                child: IgnorePointer(
-                  child: AnimatedOpacity(
-                    duration: const Duration(milliseconds: 120),
-                    opacity: _photoBusy ? 1 : 0,
-                    child: Container(
-                      color: Colors.black.withValues(alpha: 0.55),
-                      child: Center(
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                          decoration: BoxDecoration(
-                            color: AppTheme.ffPrimaryBg,
-                            border: Border.all(color: AppTheme.ffAlt),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2)),
-                              const SizedBox(width: 10),
-                              Text(_photoBusyMsg, style: const TextStyle(color: Colors.white)),
-                            ],
-                          ),
-                        ),
+        body: SafeArea(
+          child: profileAsync.when(
+            loading: () => _hydrated != _Hydration.none
+                ? form()
+                : const Center(child: CircularProgressIndicator()),
+            error: (e, _) => _hydrated != _Hydration.none
+                ? form()
+                : Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Text(
+                        'Failed to load profile: $e',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white70),
                       ),
                     ),
                   ),
+            data: (_) => form(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _bannerOverlay() {
+    return IgnorePointer(
+      ignoring: true,
+      child: SafeArea(
+        top: true,
+        bottom: false,
+        child: AnimatedSlide(
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+          offset: _isOffline ? Offset.zero : const Offset(0, -0.3),
+          child: AnimatedOpacity(
+            duration: const Duration(milliseconds: 180),
+            opacity: _isOffline ? 1 : 0,
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: Container(
+                margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: AppTheme.ffPrimaryBg.withValues(alpha: .92),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: _outline.withValues(alpha: .55)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: const [
+                    Icon(Icons.wifi_off_rounded, size: 16, color: Colors.white70),
+                    SizedBox(width: 8),
+                    Text('You’re offline — edits will sync when back online',
+                        style: TextStyle(color: Colors.white, fontSize: 12.5)),
+                  ],
                 ),
               ),
-          ],
+            ),
+          ),
         ),
       ),
     );
@@ -871,19 +866,18 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
       ),
     );
 
-    // ⬇️ Added: fix `use_build_context_synchronously` by guarding BuildContext after await
     if (!context.mounted) return false;
 
     switch (action) {
       case _LeaveAction.discard:
         _dirty = false;
-        return true;              // allow PopScope to pop
+        return true;
       case _LeaveAction.save:
-        await _onSave();          // _onSave() already navigates
-        return false;             // <- prevent PopScope from popping again
+        await _onSave();
+        return false;
       case _LeaveAction.cancel:
       default:
-        return false;             // stay on page
+        return false;
     }
   }
 
@@ -898,13 +892,12 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
         onPicturesUpdated: (urls) async {
           if (!mounted) return;
           setState(() {
-            _pictures
-              ..clear()
-              ..addAll(urls);
+            _pictures..clear()..addAll(urls);
           });
           final raw = await PeerProfileCache.instance.read(uid) ?? <String, dynamic>{'user_id': uid};
           raw['profile_pictures'] = urls;
           await PeerProfileCache.instance.write(uid, raw);
+          _warmPhotos();
         },
       );
 
@@ -914,10 +907,9 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
         final current = _extractPictures(storeProfile);
         if (mounted && current.isNotEmpty) {
           setState(() {
-            _pictures
-              ..clear()
-              ..addAll(current);
+            _pictures..clear()..addAll(current);
           });
+          _warmPhotos();
         }
       }
     } catch (_) {
@@ -964,6 +956,7 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
   Future<void> _openPhotoViewer(int index) async {
     if (index < 0 || index >= _pictures.length) return;
     final raw = _pictures[index];
+    final ownerUid = _meId();
 
     await showGeneralDialog(
       context: context,
@@ -980,8 +973,9 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
             children: [
               Center(
                 child: InteractiveViewer(
-                  child: _SignedImage(
+                  child: _ResolvedImage(
                     rawUrlOrPath: raw,
+                    ownerUid: ownerUid,
                     fit: BoxFit.contain,
                     explicitLogicalWidth: mq.size.width,
                     explicitCacheWidth: targetW,
@@ -1209,18 +1203,14 @@ class _EditProfilePageState extends ConsumerState<EditProfilePage> {
       await PeerProfileCache.instance.write(me, raw);
 
       // Persist to Supabase (upsert on user_id)
-      await Supabase.instance.client
-          .from('profiles')
-          .upsert({...patch, 'user_id': me}, onConflict: 'user_id');
+      await Supabase.instance.client.from('profiles').upsert({...patch, 'user_id': me}, onConflict: 'user_id');
 
-      // Mark clean before navigation
       _dirty = false;
 
       // Nudge a background refresh
       ref.read(profile_facade.myProfileProvider.notifier).refresh();
 
       if (!mounted) return;
-      // Prefer returning to the previous screen (Profile View). Fallback to a direct route.
       if (Navigator.of(context).canPop()) {
         Navigator.of(context).pop(true); // return “saved”
       } else {
@@ -1638,7 +1628,14 @@ class _NumberPickerRow extends StatelessWidget {
 }
 
 class _PhotosGrid extends StatelessWidget {
-  const _PhotosGrid({required this.pictures, required this.onAdd, required this.onTapImage});
+  const _PhotosGrid({
+    required this.ownerUid,
+    required this.pictures,
+    required this.onAdd,
+    required this.onTapImage,
+  });
+
+  final String ownerUid;
   final List<String> pictures;
   final VoidCallback onAdd;
   final ValueChanged<int> onTapImage; // index-based
@@ -1653,7 +1650,7 @@ class _PhotosGrid extends StatelessWidget {
           onTap: () => onTapImage(i),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(12),
-            child: _SignedImage(rawUrlOrPath: shown[i], fit: BoxFit.cover),
+            child: _ResolvedImage(rawUrlOrPath: shown[i], ownerUid: ownerUid, fit: BoxFit.cover),
           ),
         ),
       if (shown.length < 6)
@@ -1682,16 +1679,20 @@ class _PhotosGrid extends StatelessWidget {
   }
 }
 
-/// Optimized image that resolves private storage paths and uses cacheWidth.
-class _SignedImage extends StatelessWidget {
-  const _SignedImage({
+/// Platform-aware image:
+/// - Web: resolve storage path → signed URL → Image.network (with cacheWidth).
+/// - Native: resolve if needed → OfflineImage.url for disk caching keyed by ownerUid.
+class _ResolvedImage extends StatelessWidget {
+  const _ResolvedImage({
     required this.rawUrlOrPath,
+    required this.ownerUid,
     required this.fit,
     this.explicitLogicalWidth,
     this.explicitCacheWidth,
   });
 
   final String rawUrlOrPath;
+  final String ownerUid;
   final BoxFit fit;
   final double? explicitLogicalWidth; // hint
   final int? explicitCacheWidth; // exact cacheWidth in device pixels
@@ -1703,25 +1704,42 @@ class _SignedImage extends StatelessWidget {
       final logicalW = explicitLogicalWidth ?? constraints.maxWidth;
       final cacheW = explicitCacheWidth ?? (logicalW.isFinite ? (logicalW * dpr).round() : null);
 
+      final Future<String> futureUrl = rawUrlOrPath.startsWith('http')
+          ? Future.value(rawUrlOrPath)
+          : resolveStorageUrl(supa: Supabase.instance.client, raw: rawUrlOrPath);
+
       return FutureBuilder<String>(
-        future: _SignedUrlCache.resolve(rawUrlOrPath),
+        future: futureUrl,
         builder: (context, snap) {
           if (!snap.hasData) return const _GridShimmer();
-          return Image.network(
-            snap.data!,
-            fit: fit,
-            cacheWidth: cacheW,
-            filterQuality: FilterQuality.medium,
-            gaplessPlayback: true,
-            loadingBuilder: (context, child, progress) {
-              if (progress == null) return child;
-              return const _GridShimmer();
-            },
-            errorBuilder: (_, __, ___) => const ColoredBox(
-              color: Colors.black26,
-              child: Center(child: Icon(Icons.broken_image, color: Colors.white70)),
-            ),
-          );
+          final url = snap.data!;
+          if (kIsWeb) {
+            return Image.network(
+              url,
+              fit: fit,
+              cacheWidth: cacheW,
+              filterQuality: FilterQuality.medium,
+              gaplessPlayback: true,
+              loadingBuilder: (context, child, progress) {
+                if (progress == null) return child;
+                return const _GridShimmer();
+              },
+              errorBuilder: (_, __, ___) => const ColoredBox(
+                color: Colors.black26,
+                child: Center(child: Icon(Icons.broken_image, color: Colors.white70)),
+              ),
+            );
+          } else {
+            return OfflineImage.url(
+              url: url,
+              ownerUid: ownerUid,
+              fit: fit,
+              error: const ColoredBox(
+                color: Colors.black26,
+                child: Center(child: Icon(Icons.broken_image, color: Colors.white70)),
+              ),
+            );
+          }
         },
       );
     });

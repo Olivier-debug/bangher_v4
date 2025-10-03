@@ -25,6 +25,8 @@ import '../../../ui/shimmer.dart';
 import '../../profile/data/preferences_store.dart' show myPreferencesUiStoreProvider;
 import '../../matches/data/match_seen_store.dart' show MatchSeenStore;
 import '../../matches/widgets/match_overlay.dart' as overlay show MatchOverlay, ProfileLite;
+// NEW: centralized storage URL helpers (replaces local duplications)
+import '../../../core/images/storage_url_resolver.dart';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Logging helpers
@@ -288,32 +290,7 @@ class _TestSwipeStackPageState extends ConsumerState<TestSwipeStackPage>
 
   // Display format helpers (image transform hints)
 
-  String _effectiveFormat() => 'webp';
-
-  String _addTransformsVariant({
-    required String url,
-    required int widthPx,
-    required int heightPx,
-    required double dpr,
-    int quality = 78,
-  }) {
-    if (!_isSupabaseSignedUrl(url)) return url;
-    final fmt = _effectiveFormat();
-    final sep = url.contains('?') ? '&' : '?';
-    return '$url'
-        '${sep}format=$fmt'
-        '&quality=$quality'
-        '&width=$widthPx'
-        '&height=$heightPx'
-        '&dpr=${dpr.toStringAsFixed(2)}'
-        '&fit=cover';
-  }
-
-  String _addTransformsLqip({required String url}) {
-    if (!_isSupabaseSignedUrl(url)) return url;
-    final sep = url.contains('?') ? '&' : '?';
-    return '$url${sep}format=webp&quality=35&width=64&blur=25&fit=cover';
-  }
+  String get _fmt => 'webp';
 
   String _variantCacheKey({
     required String rawUrlOrStable,
@@ -322,7 +299,7 @@ class _TestSwipeStackPageState extends ConsumerState<TestSwipeStackPage>
     required double dpr,
     required String fmt,
   }) {
-    final base = _cacheKeyForUrl(rawUrlOrStable);
+    final base = stableCacheKey(rawUrlOrStable);
     return '$base#w${widthPx}h${heightPx}d${dpr.toStringAsFixed(2)}f$fmt';
   }
 
@@ -334,23 +311,24 @@ class _TestSwipeStackPageState extends ConsumerState<TestSwipeStackPage>
     required double dpr,
   }) async {
     if (rawUrl.isEmpty) return;
-    final fmt = _effectiveFormat();
 
-    final fullUrl = _addTransformsVariant(
+    final fullUrl = addVariantTransform(
       url: rawUrl,
       widthPx: widthPx,
       heightPx: heightPx,
       dpr: dpr,
+      format: _fmt,
       quality: 78,
+      fit: 'cover',
     );
-    final lqipUrl = _addTransformsLqip(url: rawUrl);
+    final lqipUrl = addLqipTransform(url: rawUrl, format: _fmt);
 
     final fullKey = _variantCacheKey(
       rawUrlOrStable: rawUrl,
       widthPx: widthPx,
       heightPx: heightPx,
       dpr: dpr,
-      fmt: fmt,
+      fmt: _fmt,
     );
 
     final lqipProv = CachedNetworkImageProvider(
@@ -440,20 +418,21 @@ class _TestSwipeStackPageState extends ConsumerState<TestSwipeStackPage>
           final widthPx = (projectedW * dpr).round().clamp(320, 1080);
           final heightPx = (projectedH * dpr).round().clamp(480, 1920);
 
-          final fmt = _effectiveFormat();
-          final displayUrl = _addTransformsVariant(
+          final displayUrl = addVariantTransform(
             url: urlRaw,
             widthPx: widthPx,
             heightPx: heightPx,
             dpr: dpr.toDouble(),
+            format: _fmt,
             quality: 78,
+            fit: 'cover',
           );
           final cacheKey = _variantCacheKey(
             rawUrlOrStable: urlRaw,
             widthPx: widthPx,
             heightPx: heightPx,
             dpr: dpr.toDouble(),
-            fmt: fmt,
+            fmt: _fmt,
           );
 
           final prov = CachedNetworkImageProvider(
@@ -516,50 +495,22 @@ class _TestSwipeStackPageState extends ConsumerState<TestSwipeStackPage>
   @override
   bool get wantKeepAlive => true;
 
-  // Cache helpers
-
-  String _cacheKeyForUrl(String url) {
-    final parsed = _parseBucketAndPathFromSignedUrl(url);
-    if (parsed != null) {
-      final (bucket, path) = parsed;
-      return 'supabase_cache://$bucket/$path';
-    }
-    if (kIsWeb) return url;
-    final q = url.indexOf('?');
-    return q == -1 ? url : url.substring(0, q);
-  }
-
-  bool _isSupabaseSignedUrl(String url) {
-    final u = Uri.tryParse(url);
-    return u != null && u.path.contains('/storage/v1/object/sign/');
-  }
-
-  (String, String)? _parseBucketAndPathFromSignedUrl(String url) {
-    final uri = Uri.tryParse(url);
-    if (uri == null) return null;
-    final segs = uri.pathSegments;
-    final signIdx = segs.indexOf('sign');
-    if (signIdx < 0 || signIdx + 1 >= segs.length) return null;
-    final bucket = segs[signIdx + 1];
-    final rest = segs.sublist(signIdx + 2);
-    if (bucket.isEmpty || rest.isEmpty) return null;
-    final objectPath = rest.map(Uri.decodeComponent).join('/');
-    return (bucket, objectPath);
-  }
+  // Cache/signing helpers (now using StorageUrlResolver)
 
   Future<void> _refreshSignedUrlFor({
     required String cardId,
     required int photoIndex,
     required String currentUrl,
   }) async {
-    if (!_isSupabaseSignedUrl(currentUrl)) return;
+    if (!isSupabaseSignedUrl(currentUrl)) return;
     if (!_refreshingUrls.add(currentUrl)) return;
     try {
-      final parsed = _parseBucketAndPathFromSignedUrl(currentUrl);
+      final parsed = parseBucketAndPathFromSignedUrl(currentUrl);
       if (parsed == null) return;
-      final (bucket, objectPath) = parsed;
+      final bucket = parsed.bucket;
+      final objectPath = parsed.objectPath;
 
-      final stableKey = _cacheKeyForUrl(currentUrl);
+      final stableKey = stableCacheKey(currentUrl);
       await customCacheManager.removeFile(stableKey).catchError((_) {});
 
       final supa = Supabase.instance.client;
@@ -1095,24 +1046,25 @@ class _TestSwipeStackPageState extends ConsumerState<TestSwipeStackPage>
     final dpr = mq.devicePixelRatio.clamp(1.0, 3.0);
     final effectiveW = ((cardW) * dpr).round().clamp(320, 1080);
     final effectiveH = ((cardH) * dpr).round().clamp(480, 1920);
-    final fmt = _effectiveFormat();
 
-    final String displayUrl = _addTransformsVariant(
+    final String displayUrl = addVariantTransform(
       url: currentPhoto,
       widthPx: effectiveW,
       heightPx: effectiveH,
       dpr: dpr.toDouble(),
+      format: _fmt,
       quality: 78,
+      fit: 'cover',
     );
 
-    final String lqipUrl = _addTransformsLqip(url: currentPhoto);
+    final String lqipUrl = addLqipTransform(url: currentPhoto, format: _fmt);
 
     final String cacheKey = _variantCacheKey(
       rawUrlOrStable: currentPhoto,
       widthPx: effectiveW,
       heightPx: effectiveH,
       dpr: dpr.toDouble(),
-      fmt: fmt,
+      fmt: _fmt,
     );
 
     final imageCore = rawCurrent == null

@@ -779,17 +779,24 @@ class _SectionCard extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
             child: Row(
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    color: Colors.white70,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: .3,
-                  ),
-                ),
+              children: const [
+                // Subtle section heading style
               ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 13,
+                  color: Colors.white70,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: .3,
+                ),
+              ),
             ),
           ),
           const Divider(height: 1),

@@ -1,10 +1,5 @@
-// ============================================================================
-// View Profile Page (public peer)
-// - Prefill-first paint (Map<String,dynamic> to avoid type clashes)
-// - Exact color scheme + skeleton style to match UserProfile page
-// - connectivity_plus compatibility (ConnectivityResult or List<ConnectivityResult>)
-// - No image flicker (uses resolved_photos, matching Hero tags, post-frame precache)
-// ============================================================================
+// FILE: lib/features/profile/pages/view_profile_page.dart
+// View Profile Page (public peer) — wired to StorageUrlResolver for web image URLs.
 
 import 'dart:async' show StreamSubscription, unawaited;
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -18,6 +13,7 @@ import '../../../theme/app_theme.dart';
 import '../../../widgets/offline_image.dart';
 import '../../../core/cache/peer_profile_cache.dart';
 import '../../../core/cache/pinned_image_cache.dart';
+import '../../../core/images/storage_url_resolver.dart';
 
 // Shared design tokens (same vibe as your UserProfile page)
 const double kViewProfileHPad = 10;
@@ -199,7 +195,7 @@ class _ViewProfilePageState extends State<ViewProfilePage> {
     return const <String>[];
   }
 
-  // Web: resolve storage paths to signed URLs once per index.
+  // Web: resolve storage paths to signed URLs once per index. (centralized helper)
   Future<String> _resolvePhotoUrlWeb(String raw, int index) async {
     final cached = _webResolvedPhotoUrlByIndex[index];
     if (cached != null && cached.isNotEmpty) return cached;
@@ -210,33 +206,10 @@ class _ViewProfilePageState extends State<ViewProfilePage> {
       return raw;
     }
 
-    String bucket = 'profile_pictures';
-    String objectPath = raw;
-
-    if (raw.startsWith('storage://')) {
-      final without = raw.substring('storage://'.length);
-      final slash = without.indexOf('/');
-      if (slash > 0) {
-        bucket = without.substring(0, slash);
-        objectPath = without.substring(slash + 1);
-      }
-    } else if (raw.contains('/')) {
-      final parts = raw.split('/');
-      if (parts.isNotEmpty) {
-        bucket = parts.first;
-        objectPath = parts.skip(1).join('/');
-      }
-    }
-
-    try {
-      final signed = await _supa.storage.from(bucket).createSignedUrl(objectPath, 55 * 60);
-      _webResolvedPhotoUrlByIndex[index] = signed;
-      return signed;
-    } catch (_) {
-      final pub = _supa.storage.from(bucket).getPublicUrl(objectPath);
-      _webResolvedPhotoUrlByIndex[index] = pub;
-      return pub;
-    }
+    // Use the shared resolver (tries signed → falls back to public).
+    final url = await resolveStorageUrl(supa: _supa, raw: raw);
+    _webResolvedPhotoUrlByIndex[index] = url;
+    return url;
   }
 
   // 1 → fully visible; 0 → collapsed during swipe
@@ -855,7 +828,6 @@ class _ViewProfilePageState extends State<ViewProfilePage> {
     return Hero(
       tag: index == 0 ? 'public_profile_photo_$uid' : 'public_profile_photo_$index',
       flightShuttleBuilder: (ctx, anim, flightDir, fromCtx, toCtx) {
-        // show the exact widget during the flight (prevents mid-flight fades)
         final from = fromCtx.widget as Hero;
         return from.child;
       },

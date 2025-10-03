@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 class AppTheme {
-  // FlutterFlow-like palette
+  // Palette
   static const Color ffPrimary = Color(0xFFFF1493); // deep pink
   static const Color ffSecondary = Color(0xFFFF1493);
   static const Color ffTertiary = Color(0xFFE5E5E5);
@@ -31,7 +31,6 @@ class AppTheme {
   static ThemeData get dark {
     final base = ThemeData.dark(useMaterial3: true);
 
-    // Avoid deprecated background/onBackground. Use surface/onSurface instead.
     const scheme = ColorScheme.dark(
       primary: ffPrimary,
       secondary: ffSecondary,
@@ -52,7 +51,7 @@ class AppTheme {
         elevation: 0,
         centerTitle: true,
       ),
-      // NEW API: CardThemeData (not CardTheme)
+      // NOTE: your SDK expects CardThemeData / DialogThemeData
       cardTheme: CardThemeData(
         color: ffSecondaryBg,
         shape: RoundedRectangleBorder(
@@ -61,24 +60,42 @@ class AppTheme {
         elevation: 2,
         surfaceTintColor: Colors.transparent,
       ),
+      dialogTheme: DialogThemeData(
+        backgroundColor: const Color(0xFF16181C),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        surfaceTintColor: Colors.transparent,
+        titleTextStyle: GoogleFonts.inter(
+          color: Colors.white,
+          fontSize: 20,
+          fontWeight: FontWeight.w600,
+        ),
+        contentTextStyle: GoogleFonts.inter(
+          color: Colors.white70,
+          fontSize: 14,
+          fontWeight: FontWeight.w500,
+        ),
+      ),
       textTheme: _textTheme(base.textTheme, isDark: true),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
         fillColor: ffSecondaryBg,
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),
-          borderSide: BorderSide(color: const Color.fromARGB(255, 255, 255, 255).withValues(alpha: 0.6)),
+          borderSide: BorderSide(
+            color: const Color.fromARGB(255, 255, 255, 255).withValues(alpha: 0.6),
+          ),
         ),
         enabledBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),
-          borderSide: BorderSide(color: const Color.fromARGB(255, 255, 255, 255).withValues(alpha: 0.6)),
+          borderSide: BorderSide(
+            color: const Color.fromARGB(255, 255, 255, 255).withValues(alpha: 0.6),
+          ),
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),
           borderSide: const BorderSide(color: ffSecondary),
         ),
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       ),
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
@@ -112,7 +129,7 @@ class AppTheme {
   }
 
   // -----------------------
-  // Light theme (optional, handy if referenced elsewhere)
+  // Light theme
   // -----------------------
   static ThemeData get light {
     final base = ThemeData.light(useMaterial3: true);
@@ -145,6 +162,21 @@ class AppTheme {
         elevation: 2,
         surfaceTintColor: Colors.transparent,
       ),
+      dialogTheme: DialogThemeData(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        surfaceTintColor: Colors.transparent,
+        titleTextStyle: GoogleFonts.inter(
+          color: Colors.black87,
+          fontSize: 20,
+          fontWeight: FontWeight.w600,
+        ),
+        contentTextStyle: GoogleFonts.inter(
+          color: Colors.black87,
+          fontSize: 14,
+          fontWeight: FontWeight.w500,
+        ),
+      ),
       textTheme: _textTheme(base.textTheme, isDark: false),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
@@ -161,8 +193,7 @@ class AppTheme {
           borderRadius: BorderRadius.circular(14),
           borderSide: const BorderSide(color: ffSecondary),
         ),
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       ),
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(

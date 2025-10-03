@@ -1,8 +1,8 @@
 // lib/features/auth/login_page_widget.dart
 // 2025 Mobile-first, a11y-first refactor with minimal visual drift.
-// - Signup ⇒ go to create_or_complete (fresh=1)
+// - Signup ⇒ if email confirmation enabled, go to /verify-email
 // - OAuth signup ⇒ mark fresh intent; on signedIn ⇒ auto-route to fresh flow
-// - Login ⇒ router handles; fallback checks profiles row (existence + complete) and routes
+// - Login ⇒ router handles; fallback ensures profiles/preferences + routes
 // - Mounted/context-safe post-frame and nav guards
 
 import 'dart:async';
@@ -32,6 +32,10 @@ const double kIconButtonSize = 48;
 const String kRouteCreateOrCompleteName = 'createOrCompleteProfile';
 const String kRouteCreateOrCompletePath = '/create-or-complete-profile';
 const String kRouteAfterSignInFallback = '/swipe';
+
+// NEW: verify-email route constants (router already whitelists & defines the route)
+const String kRouteVerifyEmailName = 'verifyEmail';
+const String kRouteVerifyEmailPath = '/verify-email';
 
 const String kOAuthRedirectUrlMobile = 'io.supabase.flutter://login-callback/';
 const String kPasswordResetRedirectUrl = 'io.supabase.flutter://reset-callback/';
@@ -128,7 +132,7 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
       _loginAnim.forward();
     });
 
-    // Auth stream fallback router
+    // Auth stream fallback router + provisioning
     _authSub = Supabase.instance.client.auth.onAuthStateChange.listen((e) async {
       if (e.event == AuthChangeEvent.signedIn) {
         await _maybeHandlePostSignInRedirect(fromOAuth: _oauthWasSignup);
@@ -175,10 +179,7 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
     required NavigatorState navigator,
     bool fresh = false,
   }) async {
-    // Prefer direct path with query param so ShellRoutes/redirects don't drop extras.
-    final path = fresh
-        ? '$kRouteCreateOrCompletePath?fresh=1'
-        : kRouteCreateOrCompletePath;
+    final path = fresh ? '$kRouteCreateOrCompletePath?fresh=1' : kRouteCreateOrCompletePath;
 
     try {
       router.go(path, extra: {'fresh': fresh});
@@ -190,6 +191,27 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
       navigator.pushReplacementNamed(path);
     } catch (e) {
       debugPrint('Navigation error: "$kRouteCreateOrCompleteName" / "$kRouteCreateOrCompletePath" not found. $e');
+    }
+  }
+
+  // NEW: navigate to verify-email with email param
+  Future<void> _goToVerifyEmail({
+    required GoRouter router,
+    required NavigatorState navigator,
+    required String email,
+  }) async {
+    final path = '$kRouteVerifyEmailPath?email=${Uri.encodeComponent(email)}';
+    try {
+      router.go(path, extra: {'email': email, 'fresh': true});
+      return;
+    } catch (_) {
+      // fall-through
+    }
+    try {
+      // NOTE: pushNamed here uses a path; if you only use GoRouter, go() above will handle it.
+      navigator.pushNamed(path);
+    } catch (e) {
+      debugPrint('Navigation error: "$kRouteVerifyEmailName" / "$kRouteVerifyEmailPath" not found. $e');
     }
   }
 
@@ -215,28 +237,25 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
     return p.getBool(kFreshIntentKey) == true;
   }
 
+  /// Wait (briefly) for a real authenticated session; avoids anon writes.
+  Future<Session?> _waitForSession({Duration timeout = const Duration(seconds: 3)}) async {
+    final client = Supabase.instance.client;
+    final end = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(end)) {
+      final s = client.auth.currentSession;
+      if (s != null) return s;
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+    }
+    return client.auth.currentSession;
+  }
+
   Future<void> _ensureRowByUserId(String table, String userId) async {
     final supabase = Supabase.instance.client;
-    try {
-      await supabase.from(table).upsert(
-        {'user_id': userId},
-        onConflict: 'user_id',
-        ignoreDuplicates: true,
-      );
-    } on PostgrestException catch (e) {
-      if (e.code == '42P10') {
-        final existing = await supabase.from(table).select('user_id').eq('user_id', userId).maybeSingle();
-        if (existing == null) {
-          try {
-            await supabase.from(table).insert({'user_id': userId});
-          } on PostgrestException catch (ee) {
-            if (ee.code != '23505') rethrow;
-          }
-        }
-      } else if (e.code != '23505') {
-        rethrow;
-      }
-    }
+    await supabase.from(table).upsert(
+      {'user_id': userId},
+      onConflict: 'user_id',
+      ignoreDuplicates: true,
+    );
   }
 
   // -------------------- AUTH ACTIONS --------------------
@@ -261,24 +280,22 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
       final AuthResponse res = await supabase.auth.signUp(
         email: email,
         password: password,
+        // For OTP email-code flow, redirect is optional; leaving it is harmless.
         emailRedirectTo: kIsWeb ? null : kOAuthRedirectUrlMobile,
       );
 
-      final user = res.user;
-      if (user == null) {
-        _showSnack('Check your email to confirm your account.');
+      // ✅ If confirmations are ON, you'll get NO session yet ⇒ go to verify.
+      // (Some projects return user but still no session until confirm.)
+      if (res.session == null || res.user == null) {
+        _showSnack('We emailed you a 6-digit code.');
+        await _goToVerifyEmail(router: router, navigator: navigator, email: email);
         return;
       }
 
-      final userId = user.id;
-      await _ensureRowByUserId('profiles', userId);
-      await _ensureRowByUserId('preferences', userId);
-
-      // Directly go to Create/Complete in fresh mode (with query + extra).
-      await _goToCreateOrComplete(router: router, navigator: navigator, fresh: true);
-      _handledPostSignIn = true; // avoid stream double-nav
-      _oauthWasSignup = false;
-      await _clearFreshIntent();
+      // If confirmations are OFF: do NOT write immediately (race risk).
+      // Provision after the signedIn event (auth stream), when the session is fully active.
+      _showSnack('Account created! Finalizing setup…');
+      // Nothing else to do here; _maybeHandlePostSignInRedirect will run.
     } on AuthException catch (e) {
       final msg = e.message;
       if (msg.toLowerCase().contains('already registered')) {
@@ -318,7 +335,7 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
         _showSnack('Sign-in succeeded but no user returned. Verify your email or try again.');
         return;
       }
-      // No explicit nav here; stream fallback will route if needed.
+      // No explicit nav here; stream fallback will route + provision if needed.
     } on AuthException catch (e) {
       _showSnack(e.message);
     } catch (e) {
@@ -414,14 +431,20 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
     } on AuthException catch (e) {
       _showSnack(e.message);
     } catch (e) {
-      _showSnack('Could not send reset link: $e');
+      _showSnack('Could not send reset link: $e.');
     }
   }
 
-  // ---------- Post sign-in redirect fallback ----------
+  // ---------- Post sign-in redirect + provisioning fallback ----------
   Future<void> _maybeHandlePostSignInRedirect({required bool fromOAuth}) async {
     if (_handledPostSignIn) return;
+
     final client = Supabase.instance.client;
+
+    // Ensure we actually have a non-anon session (important on Web).
+    final session = await _waitForSession();
+    if (session == null) return;
+
     final me = client.auth.currentUser;
     if (me == null) return;
 
@@ -429,41 +452,43 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
     final navigator = mounted ? Navigator.of(context) : null;
 
     try {
-      // If this was an OAuth sign-up we marked earlier, treat as fresh.
-      if (fromOAuth && await _hasFreshIntent()) {
+      // Fresh OAuth signup intent: go straight to create/complete after provisioning
+      final bool treatAsFresh = fromOAuth && await _hasFreshIntent();
+      if (treatAsFresh) {
         await _clearFreshIntent();
-        if (router != null && navigator != null) {
-          await _goToCreateOrComplete(router: router, navigator: navigator, fresh: true);
-          _handledPostSignIn = true;
-          _oauthWasSignup = false;
-          return;
-        }
       }
 
-      // Fallback completeness check; also detect truly brand-new (no profiles row).
-      final uid = me.id;
-      final row = await client
-          .from('profiles')
-          .select('user_id, complete')
-          .eq('user_id', uid)
-          .maybeSingle();
-
-      final bool hasRow = row != null;
-      final bool isComplete = (row?['complete'] as bool?) ?? false;
-      final bool brandNew = !hasRow;
+      // Idempotent provisioning (safe whether rows exist or not)
+      try {
+        await _ensureRowByUserId('profiles', me.id);
+        await _ensureRowByUserId('preferences', me.id);
+      } on PostgrestException catch (e) {
+        debugPrint('Provisioning failed: ${e.message}');
+      }
 
       if (router != null && navigator != null) {
-        if (isComplete) {
+        // Decide where to go based on profile completeness (best-effort)
+        bool isComplete = false;
+        try {
+          final row = await client
+              .from('profiles')
+              .select('complete')
+              .eq('user_id', me.id)
+              .maybeSingle();
+          isComplete = (row?['complete'] as bool?) ?? false;
+        } catch (_) {
+          // ignore — route to create/complete by default if unsure
+        }
+
+        if (treatAsFresh) {
+          await _goToCreateOrComplete(router: router, navigator: navigator, fresh: true);
+        } else if (isComplete) {
           router.go(kRouteAfterSignInFallback);
         } else {
-          // If there's no row yet, this is definitely fresh.
-          await _goToCreateOrComplete(
-            router: router,
-            navigator: navigator,
-            fresh: brandNew, // true when null row
-          );
+          await _goToCreateOrComplete(router: router, navigator: navigator, fresh: true);
         }
         _handledPostSignIn = true;
+        _oauthWasSignup = false;
       }
     } catch (_) {
       // Silent: router may already be handling it via its own auth redirect.
@@ -566,8 +591,8 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
                                               passVisible: passCreateVisible,
                                               isSubmitting: _isSubmittingCreate || _isOauthLaunching,
                                               onToggleVisibility: () => setState(() => passCreateVisible = !passCreateVisible),
-                                              onSubmit: _handleCreateAccount,           // email signup → fresh
-                                              onGoogle: _handleGoogleSignUp,            // OAuth signup → fresh via stream fallback
+                                              onSubmit: _handleCreateAccount,           // email signup
+                                              onGoogle: _handleGoogleSignUp,            // OAuth signup
                                               onApple: canUseApple ? _handleAppleSignUp : null,
                                               inputDecoration: _inputDecoration,
                                             ),
@@ -588,8 +613,8 @@ class LoginPageWidgetState extends State<LoginPageWidget> with TickerProviderSta
                                               passVisible: passVisible,
                                               isSubmitting: _isSubmittingSignIn || _isOauthLaunching,
                                               onToggleVisibility: () => setState(() => passVisible = !passVisible),
-                                              onSubmit: _handleSignIn,                  // email login → router/stream decides
-                                              onGoogle: _handleGoogleLogin,             // OAuth login → not fresh
+                                              onSubmit: _handleSignIn,
+                                              onGoogle: _handleGoogleLogin,
                                               onApple: canUseApple ? _handleAppleLogin : null,
                                               onForgot: _handleForgotPassword,
                                               inputDecoration: _inputDecoration,
